@@ -1,12 +1,11 @@
 # BacklineAnalyzer.py
 import cv2
 import numpy as np
-from scipy.signal import savgol_filter
-from scipy.interpolate import interp1d
 import tensorflow as tf
 from tflite_runtime.interpreter import Interpreter
 from AudioCuePlayer import AudioCuePlayer
 import os
+import time
 
 # MoveNet keypoint dictionary (from MoveNet documentation)
 KEYPOINT_DICT = {
@@ -42,17 +41,23 @@ def calculate_curvature(points):
     if len(points) < 3:
         return []
 
-    desired_window = 21
-    poly_order = 2
     n = len(points)
-    max_window = n if n % 2 == 1 else n - 1
-    window_size = min(desired_window, max_window)
-    
-    if window_size <= poly_order:
-        window_size = max_window
+    window_size = min(21, n)
+    if window_size % 2 == 0:  # Ensure window size is odd
+        window_size -= 1
 
-    x_smooth = savgol_filter(points[:, 0], window_size, poly_order)
-    y_smooth = savgol_filter(points[:, 1], window_size, poly_order)
+    # Create moving average window
+    window = np.ones(window_size) / window_size
+    
+    # Apply moving average smoothing to x and y coordinates
+    x_smooth = np.convolve(points[:, 0], window, mode='valid')
+    y_smooth = np.convolve(points[:, 1], window, mode='valid')
+    
+    # Pad the results to maintain original length
+    pad_size = (len(points) - len(x_smooth)) // 2
+    x_smooth = np.pad(x_smooth, (pad_size, len(points) - len(x_smooth) - pad_size), 'edge')
+    y_smooth = np.pad(y_smooth, (pad_size, len(points) - len(y_smooth) - pad_size), 'edge')
+    
     points = np.column_stack((x_smooth, y_smooth))
     
     curvatures = []
@@ -76,7 +81,7 @@ class Landmark:
         self.score = score
 
 class BacklineAnalyzer:
-    def __init__(self, model_path, audio_files=None, thresholds=None, version=2, cooldown=10):
+    def __init__(self, model_path, audio_files=None, thresholds=None, version=2, cooldown=10, success_audio=None):
         """
         Initialize the BacklineAnalyzer with a MoveNet model.
         
@@ -86,6 +91,7 @@ class BacklineAnalyzer:
             thresholds (dict): Thresholds for posture metrics.
             version (int): Version of the backline extraction algorithm (default is 2).
             cooldown (float): Cooldown for audio cues in seconds.
+            success_audio (dict, optional): Success audio files.
         """
         # Load MoveNet model
         self.interpreter = Interpreter(model_path=model_path)
@@ -97,7 +103,9 @@ class BacklineAnalyzer:
         self.upper_curvature_history = []
         self.lower_curvature_history = []
         if audio_files and thresholds:
-            self.audio_player = AudioCuePlayer(audio_files, thresholds, cooldown)
+            self.audio_player = AudioCuePlayer(audio_files, thresholds, cooldown, 
+                                          focus_timeout=15, success_frames=5,
+                                          success_audio=success_audio)
         else:
             self.audio_player = None
 
@@ -120,27 +128,47 @@ class BacklineAnalyzer:
         upper_back, lower_back = self._split_backline(smoothed_back_points)
         avg_upper_curvature, avg_lower_curvature = self._calculate_and_update_curvature(upper_back, lower_back)
         
-        # Calculate shoulder-hip alignment ratio and points
         shoulder_hip_ratio, shoulder_point, hip_point = self._calculate_shoulder_hip_ratio(landmarks, frame)
-        
-        # Calculate forward/backward lean
         lean_angle, lean_shoulder_point, lean_hip_point = self._calculate_lean(landmarks, frame)
         
-        # Play audio cues if audio_player is initialized
-        if self.audio_player:
-            self.audio_player.play_cue('upper_back', avg_upper_curvature)
-            self.audio_player.play_cue('shoulder_hip', shoulder_hip_ratio)
-            self.audio_player.play_cue('lower_back', avg_lower_curvature)
-            
-            if lean_angle > 0:
-                self.audio_player.play_cue('forward_lean', abs(lean_angle))
-            elif lean_angle < 0:
-                self.audio_player.play_cue('backward_lean', abs(lean_angle))
+        # Collect all posture metrics in one place
+        metrics = {
+            'upper_back': avg_upper_curvature,
+            'lower_back': avg_lower_curvature,
+            'shoulder_hip': shoulder_hip_ratio,
+            'forward_lean': max(0, lean_angle)  # Only positive values for forward lean
+        }
         
-        # Visualize results
+        # Handle focus mode if audio player exists
+        focus_info = None
+        if self.audio_player:
+            # Evaluate which issue to focus on
+            focus_issue = self.audio_player.evaluate_posture_metrics(metrics)
+            
+            if focus_issue:
+                # If we have a focus issue
+                if self.audio_player.current_focus is None:
+                    # Start focusing on this issue
+                    self.audio_player.start_focus(focus_issue, metrics[focus_issue])
+                else:
+                    # Update the current focus
+                    self.audio_player.update_focus(self.audio_player.current_focus, 
+                                                metrics[self.audio_player.current_focus])
+                
+                # Save focus information for visualization
+                focus_info = {
+                    'issue': self.audio_player.current_focus,
+                    'metric': metrics[self.audio_player.current_focus] if self.audio_player.current_focus in metrics else 0,
+                    'threshold': self.audio_player.thresholds[self.audio_player.current_focus] 
+                            if self.audio_player.current_focus in self.audio_player.thresholds else 0,
+                    'success_count': self.audio_player.consecutive_good_frames,
+                    'success_target': self.audio_player.success_frames,
+                    'duration': time.time() - self.audio_player.focus_start_time if self.audio_player.current_focus else 0
+                }
+        
         self._visualize(result_img, smoothed_back_points, upper_back, lower_back, 
-                        avg_upper_curvature, avg_lower_curvature, shoulder_hip_ratio, 
-                        shoulder_point, hip_point, lean_angle)
+                       avg_upper_curvature, avg_lower_curvature, shoulder_hip_ratio, 
+                       shoulder_point, hip_point, lean_angle, focus_info)
 
         return result_img
 
@@ -185,25 +213,46 @@ class BacklineAnalyzer:
         return landmarks
 
     def _trace_backline(self, contour_points, landmarks, frame):
-        """Trace the backline from neck to hip using contour and landmarks."""
-        left_shoulder = [landmarks[KEYPOINT_DICT['left_shoulder']].x * frame.shape[1],
-                         landmarks[KEYPOINT_DICT['left_shoulder']].y * frame.shape[0]]
-        right_shoulder = [landmarks[KEYPOINT_DICT['right_shoulder']].x * frame.shape[1],
-                          landmarks[KEYPOINT_DICT['right_shoulder']].y * frame.shape[0]]
+        """
+        Trace the backline starting from the highest point of the greenscreen contour
+        and moving downward to the hip level.
+        """
+        # Get hip midpoint to know where to stop tracing
         left_hip = [landmarks[KEYPOINT_DICT['left_hip']].x * frame.shape[1],
-                    landmarks[KEYPOINT_DICT['left_hip']].y * frame.shape[0]]
+                   landmarks[KEYPOINT_DICT['left_hip']].y * frame.shape[0]]
         right_hip = [landmarks[KEYPOINT_DICT['right_hip']].x * frame.shape[1],
-                     landmarks[KEYPOINT_DICT['right_hip']].y * frame.shape[0]]
+                    landmarks[KEYPOINT_DICT['right_hip']].y * frame.shape[0]]
         hip_mid = [(left_hip[0] + right_hip[0]) / 2, (left_hip[1] + right_hip[1]) / 2]
-        neck = [(left_shoulder[0] + right_shoulder[0]) / 2, (left_shoulder[1] + right_shoulder[1]) / 2]
-
-        neck_y = neck[1]
-        indices = np.where(np.abs(contour_points[:, 1] - neck_y) < 5)[0]
-        if len(indices) == 0:
-            print("No contour points found near neck y-level.")
+        
+        # Get right shoulder x-coordinate to help filter out front-facing points
+        right_shoulder_x = landmarks[KEYPOINT_DICT['right_shoulder']].x * frame.shape[1]
+        
+        # Find the top points of the contour (lowest y-coordinates)
+        # Only consider points to the left of the right shoulder (back side of profile)
+        back_side_points = contour_points[contour_points[:, 0] < right_shoulder_x]
+        if len(back_side_points) == 0:
+            print("No contour points found on back side of body profile.")
             return None
-        start_idx = indices[np.argmin(contour_points[indices, 0])]
-
+        
+        # Find the top 10% of points by y-coordinate
+        y_sorted_indices = np.argsort(back_side_points[:, 1])
+        top_indices = y_sorted_indices[:max(int(len(y_sorted_indices) * 0.1), 5)]  # Take at least 5 points
+        
+        # From these top points, find the leftmost one
+        start_idx = np.argmin(back_side_points[top_indices, 0])
+        start_point = back_side_points[top_indices[start_idx]]
+        
+        # Now find this point in the original contour points array
+        start_point_idx = np.where((contour_points[:, 0] == start_point[0]) & 
+                                  (contour_points[:, 1] == start_point[1]))[0]
+        
+        if len(start_point_idx) == 0:
+            print("Could not find start point in contour.")
+            return None
+        
+        start_idx = start_point_idx[0]
+        
+        # Trace downward from the start point
         back_points = []
         current_idx = start_idx
         visited = set()
@@ -219,33 +268,49 @@ class BacklineAnalyzer:
         if len(back_points) < 3:
             print("Not enough points to process backline.")
             return None
+        
         return back_points
 
     def _interpolate_and_smooth(self, back_points):
-        """Interpolate and smooth backline points."""
+        """Interpolate and smooth backline points using moving average."""
         num_points = 50
-        distances = np.cumsum(np.sqrt(np.sum(np.diff(back_points, axis=0)**2, axis=1)))
-        distances = np.insert(distances, 0, 0)
+        # Calculate cumulative distances along the back_points
+        diffs = np.diff(back_points, axis=0)
+        segment_lengths = np.sqrt(np.sum(diffs**2, axis=1))
+        distances = np.insert(np.cumsum(segment_lengths), 0, 0)
         total_distance = distances[-1]
+
         if total_distance == 0:
             print("Total distance is zero, cannot interpolate.")
             return back_points
+
+        # Create new evenly spaced distances for interpolation
         interp_distances = np.linspace(0, total_distance, num_points)
-        interp_x = interp1d(distances, back_points[:, 0], kind='linear')(interp_distances)
-        interp_y = interp1d(distances, back_points[:, 1], kind='linear')(interp_distances)
+
+        # Interpolate the x and y coordinates using np.interp (replacing interp1d)
+        interp_x = np.interp(interp_distances, distances, back_points[:, 0])
+        interp_y = np.interp(interp_distances, distances, back_points[:, 1])
         back_points_interp = np.column_stack((interp_x, interp_y))
 
+        # Apply moving average smoothing (replacing savgol_filter)
         window_size = 11
-        poly_order = 2
         if len(back_points_interp) >= window_size:
-            x_smooth = savgol_filter(back_points_interp[:, 0], window_size, poly_order)
-            y_smooth = savgol_filter(back_points_interp[:, 1], window_size, poly_order)
+            window = np.ones(window_size) / window_size
+            x_smoothed_valid = np.convolve(back_points_interp[:, 0], window, mode='valid')
+            y_smoothed_valid = np.convolve(back_points_interp[:, 1], window, mode='valid')
+            
+            # Pad to preserve original length
+            pad_size = (len(back_points_interp) - len(x_smoothed_valid)) // 2
+            x_smooth = np.pad(x_smoothed_valid, (pad_size, len(back_points_interp) - len(x_smoothed_valid) - pad_size), 'edge')
+            y_smooth = np.pad(y_smoothed_valid, (pad_size, len(back_points_interp) - len(y_smoothed_valid) - pad_size), 'edge')
+            
             return np.column_stack((x_smooth, y_smooth))
+
         return back_points_interp
 
     def _split_backline(self, smoothed_back_points):
         """Split backline into upper and lower segments."""
-        upper_ratio = 0.4
+        upper_ratio = 0.5  # 50/50 split
         num_upper = int(len(smoothed_back_points) * upper_ratio)
         return smoothed_back_points[:num_upper], smoothed_back_points[num_upper:]
 
@@ -277,16 +342,12 @@ class BacklineAnalyzer:
         
         x_diff = abs(shoulder_x - hip_x)
         y_diff = abs(shoulder_y - hip_y)
-        
-        if y_diff == 0:
-            alignment_ratio = 0
-        else:
-            alignment_ratio = x_diff / y_diff
+        alignment_ratio = x_diff / y_diff if y_diff != 0 else 0
         
         return alignment_ratio, (shoulder_x, shoulder_y), (hip_x, hip_y)
         
     def _calculate_lean(self, landmarks, frame):
-        """Calculate the forward/backward lean using right shoulder and right hip."""
+        """Calculate the forward lean using right shoulder and right hip."""
         right_shoulder = landmarks[KEYPOINT_DICT['right_shoulder']]
         right_hip = landmarks[KEYPOINT_DICT['right_hip']]
         
@@ -297,77 +358,164 @@ class BacklineAnalyzer:
         
         hip_to_shoulder_vector = [shoulder_x - hip_x, shoulder_y - hip_y]
         vertical_vector = [0, -1]
-        
-        hip_to_shoulder_norm = np.sqrt(hip_to_shoulder_vector[0]**2 + hip_to_shoulder_vector[1]**2)
-        if hip_to_shoulder_norm == 0:
+        norm = np.sqrt(hip_to_shoulder_vector[0]**2 + hip_to_shoulder_vector[1]**2)
+        if norm == 0:
             return 0, (shoulder_x, shoulder_y), (hip_x, hip_y)
-            
-        hip_to_shoulder_unit = [hip_to_shoulder_vector[0]/hip_to_shoulder_norm, 
-                                hip_to_shoulder_vector[1]/hip_to_shoulder_norm]
-        
-        dot_product = hip_to_shoulder_unit[0] * vertical_vector[0] + hip_to_shoulder_unit[1] * vertical_vector[1]
+        unit_vector = [hip_to_shoulder_vector[0] / norm, hip_to_shoulder_vector[1] / norm]
+        dot_product = unit_vector[0] * vertical_vector[0] + unit_vector[1] * vertical_vector[1]
         dot_product = max(-1.0, min(1.0, dot_product))
-        
         angle_rad = np.arccos(dot_product)
         angle_deg = angle_rad * (180.0 / np.pi)
-        
         if shoulder_x > hip_x:
-            angle_deg = angle_deg  # Positive = forward lean
+            lean_angle = angle_deg
         else:
-            angle_deg = -angle_deg  # Negative = backward lean
-            
-        return angle_deg, (shoulder_x, shoulder_y), (hip_x, hip_y)
+            lean_angle = 0  # Ignore backward lean by setting it to 0
+        return lean_angle, (shoulder_x, shoulder_y), (hip_x, hip_y)
 
     def _visualize(self, result_img, smoothed_points, upper_back, lower_back, 
-                   avg_upper, avg_lower, shoulder_hip_ratio, 
-                   shoulder_point, hip_point, lean_angle=0):
+                  avg_upper, avg_lower, shoulder_hip_ratio, 
+                  shoulder_point, hip_point, lean_angle=0, focus_info=None):
         """Draw backline, curvature info, alignment ratios, and landmark points on the frame."""
+        # Display backline points
         for x, y in smoothed_points:
             cv2.circle(result_img, (int(x), int(y)), 3, (255, 255, 0), -1)
 
+        # Draw upper back line
         if len(upper_back) >= 2:
             for i in range(len(upper_back) - 1):
                 cv2.line(result_img,
                          (int(upper_back[i, 0]), int(upper_back[i, 1])),
                          (int(upper_back[i + 1, 0]), int(upper_back[i + 1, 1])),
-                         (255, 0, 0),  # Blue for upper back
-                         thickness=3)
+                         (255, 0, 0), 3)
+        # Draw lower back line
         if len(lower_back) >= 2:
             for i in range(len(lower_back) - 1):
                 cv2.line(result_img,
                          (int(lower_back[i, 0]), int(lower_back[i, 1])),
                          (int(lower_back[i + 1, 0]), int(lower_back[i + 1, 1])),
-                         (255, 0, 255),  # Magenta for lower back
-                         thickness=3)
+                         (255, 0, 255), 3)
 
+        # Calculate moving averages for smoother metrics
         moving_avg_upper = np.mean(self.upper_curvature_history) if self.upper_curvature_history else avg_upper
         moving_avg_lower = np.mean(self.lower_curvature_history) if self.lower_curvature_history else avg_lower
 
+        # Standard metrics display
         cv2.putText(result_img, f"Upper Back Curvature: {moving_avg_upper:.4f} rad",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
         cv2.putText(result_img, f"Lower Back Curvature: {moving_avg_lower:.4f} rad",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
         cv2.putText(result_img, f"Shoulder-Hip Alignment: {shoulder_hip_ratio:.4f}",
-                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
-        lean_text = "Forward" if lean_angle > 0 else "Backward" if lean_angle < 0 else "Neutral"
-        lean_color = (0, 165, 255) if lean_angle > 0 else (255, 255, 0) if lean_angle < 0 else (255, 255, 255)
-        cv2.putText(result_img, f"{lean_text} Lean: {abs(lean_angle):.1f} degrees",
-                    (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, lean_color, 2)
+        lean_text = "Forward" if lean_angle > 0 else "Neutral"
+        lean_color = (0, 165, 255) if lean_angle > 0 else (255, 255, 255)
+        cv2.putText(result_img, f"{lean_text} Lean: {abs(lean_angle if lean_angle > 0 else 0):.1f} degrees",
+                    (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, lean_color, 2)
 
+        # Draw focus mode information if available
+        if focus_info is not None and 'issue' in focus_info and focus_info['issue'] is not None:
+            # Create a semi-transparent overlay for focus mode
+            overlay = result_img.copy()
+            
+            # Draw a highlight box for the focus area
+            issue = focus_info['issue']
+            if issue == 'upper_back':
+                pts = upper_back.astype(np.int32)
+                cv2.polylines(overlay, [pts], False, (0, 0, 255), 5)
+                focus_area_text = "Focus: Upper Back"
+                focus_point = (int(upper_back[len(upper_back)//2, 0]), int(upper_back[len(upper_back)//2, 1]))
+            elif issue == 'lower_back':
+                pts = lower_back.astype(np.int32)
+                cv2.polylines(overlay, [pts], False, (255, 0, 255), 5)
+                focus_area_text = "Focus: Lower Back"
+                focus_point = (int(lower_back[len(lower_back)//2, 0]), int(lower_back[len(lower_back)//2, 1]))
+            elif issue == 'shoulder_hip':
+                cv2.line(overlay, 
+                         (int(shoulder_point[0]), int(shoulder_point[1])),
+                         (int(hip_point[0]), int(hip_point[1])),
+                         (0, 255, 0), 5)
+                focus_area_text = "Focus: Shoulder-Hip Alignment"
+                focus_point = (int((shoulder_point[0] + hip_point[0])/2), 
+                               int((shoulder_point[1] + hip_point[1])/2))
+            elif issue == 'forward_lean':
+                cv2.line(overlay,
+                         (int(hip_point[0]), int(hip_point[1])),
+                         (int(shoulder_point[0]), int(shoulder_point[1])),
+                         lean_color, 5)
+                focus_area_text = "Focus: Forward Lean"
+                focus_point = (int((shoulder_point[0] + hip_point[0])/2), 
+                               int((shoulder_point[1] + hip_point[1])/2))
+            else:
+                focus_area_text = f"Focus: {issue}"
+                focus_point = (result_img.shape[1]//2, result_img.shape[0]//2)
+            
+            # Add focus area text near the focus point
+            cv2.putText(overlay, focus_area_text,
+                        (focus_point[0] - 100, focus_point[1] - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Blend the overlay with the original image
+            alpha = 0.7  # Transparency factor
+            cv2.addWeighted(overlay, alpha, result_img, 1 - alpha, 0, result_img)
+            
+            # Draw progress bar for maintaining good posture
+            progress_width = 200
+            progress_height = 20
+            progress_x = result_img.shape[1] - progress_width - 10
+            progress_y = 30
+            
+            # Draw progress bar background
+            cv2.rectangle(result_img, (progress_x, progress_y), 
+                         (progress_x + progress_width, progress_y + progress_height),
+                         (100, 100, 100), -1)
+            
+            # Draw progress
+            if 'success_target' in focus_info and focus_info['success_target'] > 0:
+                success_count = focus_info.get('success_count', 0)
+                progress = min(1.0, success_count / focus_info['success_target'])
+                cv2.rectangle(result_img, (progress_x, progress_y), 
+                             (int(progress_x + progress_width * progress), progress_y + progress_height),
+                             (0, 255, 0), -1)
+            
+            # Draw progress text
+            success_count = focus_info.get('success_count', 0)
+            success_target = focus_info.get('success_target', 1)
+            cv2.putText(result_img, f"Progress: {success_count}/{success_target}",
+                       (progress_x, progress_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Add focus duration
+            duration = focus_info.get('duration', 0.0)
+            cv2.putText(result_img, f"Focus Time: {duration:.1f}s",
+                       (progress_x, progress_y + progress_height + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Add actionable instruction based on the focus issue
+            instruction_y = result_img.shape[0] - 50
+            if issue == 'upper_back':
+                instruction = "Straighten your upper back"
+            elif issue == 'lower_back':
+                instruction = "Flatten your lower back"
+            elif issue == 'shoulder_hip':
+                instruction = "Align shoulders over hips"
+            elif issue == 'forward_lean':
+                instruction = "Reduce forward lean"
+            else:
+                instruction = "Correct your posture"
+                
+            cv2.putText(result_img, instruction,
+                       (result_img.shape[1]//2 - 150, instruction_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+        
+        # Always draw landmark points
         cv2.circle(result_img, (int(shoulder_point[0]), int(shoulder_point[1])), 5, (0, 0, 255), -1)
         cv2.circle(result_img, (int(hip_point[0]), int(hip_point[1])), 5, (0, 255, 255), -1)
         
         cv2.line(result_img, 
                  (int(hip_point[0]), int(hip_point[1])), 
                  (int(hip_point[0]), int(hip_point[1] - 200)),
-                 (255, 255, 255),
-                 thickness=2,
-                 lineType=cv2.LINE_AA)
+                 (255, 255, 255), 2, cv2.LINE_AA)
         
         cv2.line(result_img,
                  (int(hip_point[0]), int(hip_point[1])),
                  (int(shoulder_point[0]), int(shoulder_point[1])),
-                 lean_color,
-                 thickness=2,
-                 lineType=cv2.LINE_AA)
+                 lean_color, 2, cv2.LINE_AA)
